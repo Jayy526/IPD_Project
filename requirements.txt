@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+streamlit
+yfinance
+pandas
+ta
+xgboost
+vaderSentiment
+feedparser
+beautifulsoup4
+plotly
+scikit-learn
+python-dotenv
+requests
+pydantic
+sqlalchemy
+joblib
