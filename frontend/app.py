@@ -165,14 +165,13 @@ if analyze_btn:
             st.plotly_chart(fig_gauge, use_container_width=True)
             
             # 3. Explainable AI Section
-            st.subheader("🧠 Explainable AI (SHAP)")
+            st.subheader("🧠 Explainable AI (CatBoost + DICE)")
             st.info("Why did the AI make this decision?")
             
             xai = data["explanation"]
             st.markdown(xai["explanation_text"])
             
-            st.markdown("#### Feature Importance (Top Impactors)")
-            # Create a horizontal bar chart for feature impacts
+            st.markdown("#### Feature Importance (CatBoost Impactors)")
             impacts = xai["feature_impacts"][:8] # top 8
             
             features = [i["feature"] for i in impacts]
@@ -191,9 +190,30 @@ if analyze_btn:
                 margin=dict(l=0, r=0, t=10, b=0),
                 plot_bgcolor='rgba(0,0,0,0)',
                 paper_bgcolor='rgba(0,0,0,0)',
-                xaxis_title="SHAP Value (Impact on Prediction)"
+                xaxis_title="Attribution Score (Impact on Prediction)"
             )
             st.plotly_chart(fig_shap, use_container_width=True)
+
+            st.markdown("#### DICE Counterfactuals")
+            dice_info = xai.get("dice", {})
+            if dice_info.get("available"):
+                st.markdown(dice_info.get("message", ""))
+                for counterfactual in dice_info.get("counterfactuals", [])[:3]:
+                    with st.expander(f"Counterfactual {counterfactual['rank']} toward {counterfactual['target_class']}", expanded=counterfactual['rank'] == 1):
+                        if counterfactual.get("changes"):
+                            for change in counterfactual["changes"]:
+                                delta = change.get("delta")
+                                if isinstance(delta, (int, float)):
+                                    delta_text = f" ({delta:+.2f})"
+                                else:
+                                    delta_text = ""
+                                st.markdown(
+                                    f"- **{change['feature']}**: {change['from']} → {change['to']}{delta_text}"
+                                )
+                        else:
+                            st.write("No feature changes were returned for this counterfactual.")
+            else:
+                st.info(dice_info.get("message", "DICE counterfactuals were not available for this prediction."))
 
 else:
     st.info("👈 Enter an Indian Stock Ticker (e.g., RELIANCE.NS) and click 'Analyze Stock' to begin.")

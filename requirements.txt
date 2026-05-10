@@ -4,7 +4,8 @@ streamlit
 yfinance
 pandas
 ta
-xgboost
+catboost
+dice-ml
 vaderSentiment
 feedparser
 beautifulsoup4

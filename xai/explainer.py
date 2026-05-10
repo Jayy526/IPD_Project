@@ -1,81 +1,95 @@
 """
-Explainable AI Module using XGBoost's built-in feature importance
-and custom contribution analysis.
+Explainable AI module combining CatBoost feature attributions with DICE
+counterfactual examples.
 
-This replaces SHAP with a Python 3.14-compatible approach that produces
-equivalent explainability output: feature impact charts, textual reasoning,
-and per-prediction explanations.
+The attribution layer keeps the ranked feature impact output, while the
+counterfactual layer adds concrete feature changes that could move the
+prediction toward an alternative class.
 """
 
-import pandas as pd
+from __future__ import annotations
+
 import numpy as np
-import xgboost as xgb
+import pandas as pd
+from catboost import CatBoostClassifier
+
+try:
+    import dice_ml
+except ImportError:  # pragma: no cover - handled at runtime
+    dice_ml = None
+
+
+CLASS_LABELS = ["SELL", "HOLD", "BUY"]
+MAX_BACKGROUND_ROWS = 200
+MAX_COUNTERFACTUALS = 3
+
+
+def generate_shap_dice_explanations(
+    model: CatBoostClassifier,
+    feature_names: list,
+    latest_features: pd.DataFrame,
+    predicted_class_idx: int,
+    reference_data: pd.DataFrame | None = None,
+) -> dict:
+    """Build a combined CatBoost + DICE explanation payload."""
+    shap_explanation = _build_shap_explanation(model, feature_names, latest_features, predicted_class_idx)
+    dice_explanation = _build_dice_explanation(
+        model=model,
+        feature_names=feature_names,
+        latest_features=latest_features,
+        predicted_class_idx=predicted_class_idx,
+        reference_data=reference_data,
+    )
+
+    return {
+        **shap_explanation,
+        "explanation_model": "CatBoost + DICE",
+        "dice": dice_explanation,
+    }
 
 
 def generate_shap_explanations(
-    model: xgb.XGBClassifier,
+    model: CatBoostClassifier,
+    feature_names: list,
+    latest_features: pd.DataFrame,
+    predicted_class_idx: int,
+    reference_data: pd.DataFrame | None = None,
+) -> dict:
+    """Backward-compatible alias for the combined CatBoost + DICE output."""
+    return generate_shap_dice_explanations(
+        model=model,
+        feature_names=feature_names,
+        latest_features=latest_features,
+        predicted_class_idx=predicted_class_idx,
+        reference_data=reference_data,
+    )
+
+
+def _build_shap_explanation(
+    model: CatBoostClassifier,
     feature_names: list,
     latest_features: pd.DataFrame,
     predicted_class_idx: int,
 ) -> dict:
-    """
-    Generates explainability data for the latest prediction using
-    XGBoost's built-in gain-based feature importance combined with
-    the actual feature values to compute directional contributions.
+    """Generate feature importance output from CatBoost."""
+    importance_values = np.asarray(model.get_feature_importance(prettified=False), dtype=float)
 
-    This approach is fully compatible with Python 3.14 (no numba needed)
-    and produces the same style of output as SHAP: a ranked list of
-    features with signed impact values and human-readable explanations.
+    importance_by_name = {
+        feature: float(importance_values[idx]) if idx < len(importance_values) else 0.0
+        for idx, feature in enumerate(feature_names)
+    }
 
-    Args:
-        model: Trained XGBoost model.
-        feature_names: List of feature names used during training.
-        latest_features: Single-row DataFrame with the latest data point.
-        predicted_class_idx: Index of the predicted class (0=SELL, 1=HOLD, 2=BUY).
-
-    Returns:
-        Dictionary with base_value, feature_impacts list, and explanation_text.
-    """
-    # --- 1. Get global feature importance (gain-based) ---
-    importance_dict = model.get_booster().get_score(importance_type="gain")
-
-    # Map XGBoost internal feature names (f0, f1, ...) back to real names
-    booster_feature_names = model.get_booster().feature_names
-    if booster_feature_names is None:
-        # Fallback: use positional mapping
-        booster_feature_names = [f"f{i}" for i in range(len(feature_names))]
-
-    # Build a lookup: real_name -> importance score
-    name_map = {bfn: rn for bfn, rn in zip(booster_feature_names, feature_names)}
-    importance_by_name = {}
-    for bfn, score in importance_dict.items():
-        real_name = name_map.get(bfn, bfn)
-        importance_by_name[real_name] = score
-
-    # Normalize importance to sum to 1
     total_importance = sum(importance_by_name.values()) or 1.0
+    base_value = float(1.0 / model.classes_count_) if getattr(model, "classes_count_", None) else float(1.0 / 3.0)
 
-    # --- 2. Get prediction probabilities to estimate base value ---
-    probs = model.predict_proba(latest_features[feature_names])[0]
-    base_value = float(1.0 / model.n_classes_)  # uniform prior
-
-    # --- 3. Compute signed contributions per feature ---
-    # Direction is inferred from how the feature value compares to
-    # a neutral midpoint. For technical indicators we use domain knowledge:
-    #   RSI > 70 → overbought (bearish), RSI < 30 → oversold (bullish)
-    #   Positive sentiment → bullish, Negative sentiment → bearish
-    #   Momentum / ROC > 0 → bullish
     feature_impacts = []
     for feat in feature_names:
         raw_importance = importance_by_name.get(feat, 0.0)
         normalised = raw_importance / total_importance
 
         val = float(latest_features[feat].iloc[0]) if feat in latest_features.columns else 0.0
-
-        # Determine directional sign based on feature semantics
         sign = _compute_direction(feat, val, predicted_class_idx)
-
-        impact = sign * normalised  # signed contribution
+        impact = sign * normalised
 
         feature_impacts.append({
             "feature": feat,
@@ -83,13 +97,9 @@ def generate_shap_explanations(
             "shap_value": round(impact, 6),
         })
 
-    # Sort by absolute impact (largest effect first)
     feature_impacts.sort(key=lambda x: abs(x["shap_value"]), reverse=True)
 
-    # --- 4. Generate human-readable explanation ---
-    classes = ["SELL", "HOLD", "BUY"]
-    predicted_label = classes[predicted_class_idx]
-
+    predicted_label = CLASS_LABELS[predicted_class_idx]
     top_positive = [f for f in feature_impacts if f["shap_value"] > 0][:3]
     top_negative = [f for f in feature_impacts if f["shap_value"] < 0][:3]
 
@@ -97,15 +107,15 @@ def generate_shap_explanations(
     for item in top_positive:
         explanation_text += (
             f"- **{item['feature']}** (value: {item['value']:.2f}) "
-            f"strongly pushed the prediction towards {predicted_label}.\n"
+            f"pushed the prediction towards {predicted_label}.\n"
         )
 
     if top_negative:
-        explanation_text += "\nHowever, the following factors reduced the confidence:\n"
+        explanation_text += "\nThe following factors reduced the confidence:\n"
         for item in top_negative:
             explanation_text += (
                 f"- **{item['feature']}** (value: {item['value']:.2f}) "
-                f"had a negative effect on this prediction.\n"
+                f"worked against this prediction.\n"
             )
 
     return {
@@ -115,19 +125,172 @@ def generate_shap_explanations(
     }
 
 
-def _compute_direction(feature_name: str, value: float, predicted_class: int) -> float:
-    """
-    Determines whether a feature's current value supports or opposes
-    the predicted class. Returns +1.0 or -1.0.
+def _build_dice_explanation(
+    model: xgb.XGBClassifier,
+    feature_names: list,
+    latest_features: pd.DataFrame,
+    predicted_class_idx: int,
+    reference_data: pd.DataFrame | None,
+) -> dict:
+    """Generate DICE counterfactuals for the latest prediction."""
+    if dice_ml is None:
+        return {
+            "available": False,
+            "message": "dice-ml is not installed in this environment.",
+            "counterfactuals": [],
+        }
 
-    Uses domain-specific heuristics for common technical & sentiment features.
-    """
+    if reference_data is None or reference_data.empty:
+        return {
+            "available": False,
+            "message": "Counterfactuals require reference data from the training slice.",
+            "counterfactuals": [],
+        }
+
+    background = reference_data[feature_names].dropna().tail(MAX_BACKGROUND_ROWS).copy()
+    if background.empty:
+        return {
+            "available": False,
+            "message": "No clean reference rows were available for DICE.",
+            "counterfactuals": [],
+        }
+
+    background = background.drop_duplicates().reset_index(drop=True)
+    background["target"] = model.predict(background[feature_names])
+
+    query_instance = latest_features[feature_names].copy()
+    query_instance = query_instance.fillna(background.median(numeric_only=True))
+
+    desired_class_idx = _select_counterfactual_class(model, query_instance, predicted_class_idx)
+    if desired_class_idx == predicted_class_idx:
+        return {
+            "available": False,
+            "message": "A contrasting DICE class could not be selected.",
+            "counterfactuals": [],
+        }
+
+    try:
+        data_interface = dice_ml.Data(
+            dataframe=background,
+            continuous_features=feature_names,
+            outcome_name="target",
+        )
+        model_interface = dice_ml.Model(model=model, backend="sklearn", model_type="classifier")
+        explainer = dice_ml.Dice(data_interface, model_interface, method="random")
+        counterfactuals = explainer.generate_counterfactuals(
+            query_instances=query_instance,
+            total_CFs=MAX_COUNTERFACTUALS,
+            desired_class=int(desired_class_idx),
+            features_to_vary="all",
+            verbose=False,
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "message": f"DICE counterfactual generation failed: {exc}",
+            "counterfactuals": [],
+        }
+
+    if not getattr(counterfactuals, "cf_examples_list", None):
+        return {
+            "available": False,
+            "message": "DICE did not return any counterfactual examples.",
+            "counterfactuals": [],
+        }
+
+    cf_example = counterfactuals.cf_examples_list[0]
+    final_cfs_df = getattr(cf_example, "final_cfs_df", None)
+    if final_cfs_df is None or final_cfs_df.empty:
+        return {
+            "available": False,
+            "message": "DICE did not find a valid counterfactual for this prediction.",
+            "counterfactuals": [],
+        }
+
+    current_row = query_instance.iloc[0]
+    cf_records = []
+    for rank, (_, cf_row) in enumerate(final_cfs_df.head(MAX_COUNTERFACTUALS).iterrows(), start=1):
+        changes = []
+        feature_values = {}
+
+        for feat in feature_names:
+            current_value = _serialize_value(current_row.get(feat))
+            target_value = _serialize_value(cf_row.get(feat))
+            feature_values[feat] = target_value
+
+            if not _values_match(current_value, target_value):
+                changes.append({
+                    "feature": feat,
+                    "from": current_value,
+                    "to": target_value,
+                    "delta": _difference(current_value, target_value),
+                })
+
+        cf_records.append({
+            "rank": rank,
+            "target_class": CLASS_LABELS[desired_class_idx],
+            "changes": changes[:5],
+            "feature_values": feature_values,
+        })
+
+    summary = _build_counterfactual_summary(cf_records, predicted_class_idx, desired_class_idx)
+    return {
+        "available": True,
+        "message": summary,
+        "target_class": CLASS_LABELS[desired_class_idx],
+        "counterfactuals": cf_records,
+    }
+
+
+def _build_counterfactual_summary(counterfactuals: list, predicted_class_idx: int, desired_class_idx: int) -> str:
+    predicted_label = CLASS_LABELS[predicted_class_idx]
+    desired_label = CLASS_LABELS[desired_class_idx]
+
+    if not counterfactuals:
+        return f"No DICE counterfactuals were generated to move from {predicted_label} toward {desired_label}."
+
+    first_cf = counterfactuals[0]
+    changes = first_cf.get("changes", [])[:3]
+    if not changes:
+        return f"DICE found a counterfactual route from {predicted_label} toward {desired_label}."
+
+    change_bits = []
+    for change in changes:
+        feature = change["feature"]
+        from_value = change["from"]
+        to_value = change["to"]
+        if isinstance(from_value, (int, float)) and isinstance(to_value, (int, float)):
+            change_bits.append(f"{feature} {from_value:.2f} -> {to_value:.2f}")
+        else:
+            change_bits.append(f"{feature} {from_value} -> {to_value}")
+
+    joined_changes = ", ".join(change_bits)
+    return f"To move the prediction from {predicted_label} toward {desired_label}, DICE suggests adjusting {joined_changes}."
+
+
+def _select_counterfactual_class(
+    model: xgb.XGBClassifier,
+    query_instance: pd.DataFrame,
+    predicted_class_idx: int,
+) -> int:
+    probabilities = model.predict_proba(query_instance)[0]
+    ranked_classes = np.argsort(probabilities)[::-1]
+
+    for class_idx in ranked_classes:
+        if int(class_idx) != int(predicted_class_idx):
+            return int(class_idx)
+
+    return int(predicted_class_idx)
+
+
+def _compute_direction(feature_name: str, value: float, predicted_class: int) -> float:
+    """Determine whether a feature value supports or opposes the prediction."""
     bullish_signal = False
 
     fn = feature_name.lower()
 
     if "rsi" in fn:
-        bullish_signal = value < 50  # Low RSI → oversold → bullish
+        bullish_signal = value < 50
     elif "macd" in fn:
         bullish_signal = value > 0
     elif "roc" in fn or "momentum" in fn:
@@ -141,16 +304,36 @@ def _compute_direction(feature_name: str, value: float, predicted_class: int) ->
     elif "negative_count" in fn:
         bullish_signal = value < 2
     elif "sma_20" in fn or "sma_50" in fn or "sma_200" in fn:
-        bullish_signal = True  # Presence of support levels
+        bullish_signal = True
     elif "atr" in fn:
-        bullish_signal = value < 50  # Lower volatility can be seen as stable
+        bullish_signal = value < 50
     else:
         bullish_signal = value > 0
 
-    # BUY=2, SELL=0. If signal is bullish and prediction is BUY → positive.
-    if predicted_class == 2:  # BUY
+    if predicted_class == 2:
         return 1.0 if bullish_signal else -1.0
-    elif predicted_class == 0:  # SELL
+    if predicted_class == 0:
         return 1.0 if not bullish_signal else -1.0
-    else:  # HOLD
-        return 0.5 if bullish_signal else -0.5
+    return 0.5 if bullish_signal else -0.5
+
+
+def _serialize_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _values_match(left, right) -> bool:
+    if left is None and right is None:
+        return True
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return bool(np.isclose(left, right))
+    return left == right
+
+
+def _difference(left, right):
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return round(float(right) - float(left), 6)
+    return None

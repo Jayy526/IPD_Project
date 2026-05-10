@@ -9,7 +9,7 @@ from data_pipeline.market_data import get_processed_data
 from news_pipeline.news_fetcher import get_news
 from news_pipeline.sentiment import process_news_sentiment
 from models.xgboost_model import get_or_train_model, predict_latest
-from xai.explainer import generate_shap_explanations
+from xai.explainer import generate_shap_dice_explanations
 
 app = FastAPI(title="Explainable AI Stock Advisor API")
 
@@ -26,10 +26,14 @@ app.add_middleware(
 def clean_dict_for_json(d: dict) -> dict:
     clean = {}
     for k, v in d.items():
-        if isinstance(v, float) and (pd.isna(v) or np.isinf(v)):
-            clean[k] = None
-        elif isinstance(v, dict):
+        if isinstance(v, dict):
             clean[k] = clean_dict_for_json(v)
+        elif isinstance(v, list):
+            clean[k] = [clean_dict_for_json(item) if isinstance(item, dict) else item for item in v]
+        elif isinstance(v, np.generic):
+            clean[k] = v.item()
+        elif isinstance(v, float) and (pd.isna(v) or np.isinf(v)):
+            clean[k] = None
         else:
             clean[k] = v
     return clean
@@ -44,9 +48,9 @@ def analyze_stock(ticker: str, force_retrain: bool = Query(False, description="F
     Complete analysis pipeline:
     1. Fetch stock data and calculate indicators.
     2. Fetch news and calculate sentiment.
-    3. Train or load XGBoost model.
+    3. Train or load CatBoost model.
     4. Predict future movement (BUY/HOLD/SELL).
-    5. Generate SHAP explanations.
+    5. Generate SHAP + DICE explanations.
     """
     try:
         # 1. Data Pipeline
@@ -74,7 +78,13 @@ def analyze_stock(ticker: str, force_retrain: bool = Query(False, description="F
         pred_idx = classes.index(prediction_results["recommendation"])
         
         latest_features = prediction_results["latest_features"]
-        shap_explanation = generate_shap_explanations(model, feature_names, latest_features, pred_idx)
+        shap_explanation = generate_shap_dice_explanations(
+            model,
+            feature_names,
+            latest_features,
+            pred_idx,
+            reference_data=X,
+        )
         
         response_data = {
             "ticker": ticker.upper(),
