@@ -6,7 +6,8 @@ pandas
 ta
 catboost
 dice-ml
-vaderSentiment
+torch
+transformers
 feedparser
 beautifulsoup4
 plotly
