@@ -141,7 +141,7 @@ if analyze_btn:
         with left_col:
             st.subheader("📊 Market Activity")
             fig_candle = plot_candlestick(data["chart_data"])
-            st.plotly_chart(fig_candle, use_container_width=True)
+            st.plotly_chart(fig_candle, width='stretch')
             
             st.subheader("📰 Financial News Sentiment")
             sent = data["sentiment"]
@@ -162,7 +162,7 @@ if analyze_btn:
         with right_col:
             st.subheader("🤖 AI Prediction")
             fig_gauge = plot_gauge(data["confidence"], data["recommendation"])
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width='stretch')
             
             # 3. Explainable AI Section
             st.subheader("🧠 Explainable AI (CatBoost + DICE)")
@@ -192,7 +192,7 @@ if analyze_btn:
                 paper_bgcolor='rgba(0,0,0,0)',
                 xaxis_title="Attribution Score (Impact on Prediction)"
             )
-            st.plotly_chart(fig_shap, use_container_width=True)
+            st.plotly_chart(fig_shap, width='stretch')
 
             st.markdown("#### DICE Counterfactuals")
             dice_info = xai.get("dice", {})
